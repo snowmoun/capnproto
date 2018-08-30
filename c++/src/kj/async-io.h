@@ -203,6 +203,21 @@ struct CapabilityPipe {
   Own<AsyncCapabilityStream> ends[2];
 };
 
+struct Tee {
+  // Two AsyncInputStreams which each read the same data from some wrapped inner AsyncInputStream.
+
+  Own<AsyncInputStream> ins[2];
+};
+
+Tee newTee(Own<AsyncInputStream> input);
+// Constructs a Tee that operates in-process. The tee buffers data if `read()` or `tryRead()` is
+// called on one of the input ends. If `read()`, `tryRead()`, or `pumpTo()` are subsequently called
+// on the other input end, the buffered data is consumed.
+//
+// `pumpTo()` operations on the input ends do not contribute to "vacuum" unless there are two active
+// simultaneously, in which case they pump freely at the rate of the greater of the two consumers'
+// backpressure (the slower sink). This way no buffering is done for two pump operations.
+
 class ConnectionReceiver {
   // Represents a server socket listening on a port.
 

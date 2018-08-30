@@ -1375,5 +1375,223 @@ KJ_TEST("Userland pipe pumpFrom EOF on abortRead()") {
   pipe2.out = nullptr;
 }
 
+KJ_TEST("Userland tee") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  auto pipe = newOneWayPipe();
+  auto tee = newTee(kj::mv(pipe.in));
+  auto left = mv(tee.ins[0]);
+  auto right = mv(tee.ins[1]);
+
+  auto writePromise = pipe.out->write("foobar", 6);
+
+  expectRead(*left, "foobar").wait(ws);
+  writePromise.wait(ws);
+  expectRead(*right, "foobar").wait(ws);
+}
+
+KJ_TEST("Userland tee concurrent read") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  auto pipe = newOneWayPipe();
+  auto tee = newTee(kj::mv(pipe.in));
+  auto left = mv(tee.ins[0]);
+  auto right = mv(tee.ins[1]);
+
+  uint8_t leftBuf[6];
+  uint8_t rightBuf[6];
+  auto leftPromise = left->tryRead(leftBuf, 6, 6);
+  auto rightPromise = right->tryRead(rightBuf, 6, 6);
+  KJ_EXPECT(!leftPromise.poll(ws));
+  KJ_EXPECT(!rightPromise.poll(ws));
+
+  pipe.out->write("foobar", 6).wait(ws);
+
+  leftPromise.wait(ws);
+  rightPromise.wait(ws);
+
+  KJ_EXPECT(memcmp(leftBuf, "foobar", 6) == 0);
+  KJ_EXPECT(memcmp(leftBuf, "foobar", 6) == 0);
+}
+
+KJ_TEST("Userland tee cancel and restart read") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  auto pipe = newOneWayPipe();
+  auto tee = newTee(kj::mv(pipe.in));
+  auto left = mv(tee.ins[0]);
+  auto right = mv(tee.ins[1]);
+
+  auto writePromise = pipe.out->write("foobar", 6);
+
+  {
+    // Initiate a read and immediately cancel it.
+    uint8_t buf[6];
+    auto promise = left->tryRead(buf, 6, 6);
+  }
+
+  // Subsequent reads still see the full data.
+  expectRead(*left, "foobar").wait(ws);
+  writePromise.wait(ws);
+  expectRead(*right, "foobar").wait(ws);
+}
+
+KJ_TEST("Userland tee cancel read and destroy branch then read other branch") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  auto pipe = newOneWayPipe();
+  auto tee = newTee(kj::mv(pipe.in));
+  auto left = mv(tee.ins[0]);
+  auto right = mv(tee.ins[1]);
+
+  auto writePromise = pipe.out->write("foobar", 6);
+
+  {
+    // Initiate a read and immediately cancel it.
+    uint8_t buf[6];
+    auto promise = left->tryRead(buf, 6, 6);
+  }
+
+  // And destroy the branch for good measure.
+  left = nullptr;
+
+  // Subsequent reads on the other branch still see the full data.
+  expectRead(*right, "foobar").wait(ws);
+  writePromise.wait(ws);
+}
+
+KJ_TEST("Userland tee subsequent other-branch reads are READY_NOW") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  auto pipe = newOneWayPipe();
+  auto tee = newTee(kj::mv(pipe.in));
+  auto left = mv(tee.ins[0]);
+  auto right = mv(tee.ins[1]);
+
+  uint8_t leftBuf[6];
+  auto leftPromise = left->tryRead(leftBuf, 6, 6);
+  // This is the first read, so there should NOT be buffered data.
+  KJ_EXPECT(!leftPromise.poll(ws));
+  pipe.out->write("foobar", 6).wait(ws);
+  leftPromise.wait(ws);
+  KJ_EXPECT(memcmp(leftBuf, "foobar", 6) == 0);
+
+  uint8_t rightBuf[6];
+  auto rightPromise = right->tryRead(rightBuf, 6, 6);
+  // The left read promise was fulfilled, so there SHOULD be buffered data.
+  KJ_EXPECT(rightPromise.poll(ws));
+  rightPromise.wait(ws);
+  KJ_EXPECT(memcmp(rightBuf, "foobar", 6) == 0);
+}
+
+KJ_TEST("Userland tee EOF propagation") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  auto pipe = newOneWayPipe();
+  auto writePromise = pipe.out->write("foobar", 6);
+  auto tee = newTee(mv(pipe.in));
+  auto left = mv(tee.ins[0]);
+  auto right = mv(tee.ins[1]);
+
+  uint8_t leftBuf[7];
+  auto leftPromise = left->tryRead(&leftBuf, 7, 7);
+  writePromise.wait(ws);
+  // Destroying the output side should force a short read.
+  pipe.out = nullptr;
+  auto leftResult = leftPromise.wait(ws);
+  KJ_EXPECT(leftResult == 6, leftResult);
+  KJ_EXPECT(memcmp(leftBuf, "foobar", 6) == 0);
+
+  // And we should see a short read here, too.
+  uint8_t rightBuf[7];
+  auto rightResult = right->tryRead(&rightBuf, 7, 7).wait(ws);
+  KJ_EXPECT(rightResult == 6, rightResult);
+  KJ_EXPECT(memcmp(rightBuf, "foobar", 6) == 0);
+}
+
+KJ_TEST("Userland tee error propagation") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  // Make a pipe expecting to read more than we're actually going to write. This will force a "pipe
+  // ended prematurely" exception once the pipe sees a short read.
+  auto pipe = newOneWayPipe(7);
+  auto writePromise = pipe.out->write("foobar", 6);
+  auto tee = newTee(mv(pipe.in));
+  auto left = mv(tee.ins[0]);
+  auto right = mv(tee.ins[1]);
+
+  uint8_t leftBuf[7];
+  auto leftPromise = left->tryRead(leftBuf, 6, 7);
+  writePromise.wait(ws);
+  // Destroying the output side should force an exception.
+  pipe.out = nullptr;
+  auto leftResult = leftPromise.wait(ws);
+  KJ_EXPECT(leftResult == 6, leftResult);
+  KJ_EXPECT(memcmp(leftBuf, "foobar", 6) == 0);
+  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("pipe ended prematurely",
+      left->tryRead(leftBuf, 1, 1).wait(ws));
+
+  // And we should see a short read here, too, after the buffered data.
+  uint8_t rightBuf[7];
+  auto rightResult = right->tryRead(rightBuf, 6, 7).wait(ws);
+  KJ_EXPECT(rightResult == 6, rightResult);
+  KJ_EXPECT(memcmp(rightBuf, "foobar", 6) == 0);
+  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("pipe ended prematurely",
+      right->tryRead(rightBuf, 1, 1).wait(ws));
+}
+
+KJ_TEST("Userland tee error propagation w/ data loss") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  // Make a pipe expecting to read more than we're actually going to write. This will force a "pipe
+  // ended prematurely" exception once the pipe sees a short read.
+  auto pipe = newOneWayPipe(7);
+  auto writePromise = pipe.out->write("foobar", 6);
+  auto tee = newTee(mv(pipe.in));
+  auto left = mv(tee.ins[0]);
+  auto right = mv(tee.ins[1]);
+
+  uint8_t leftBuf[7];
+  auto leftPromise = left->tryRead(leftBuf, 7, 7);
+  writePromise.wait(ws);
+  // Destroying the output side should force an exception.
+  pipe.out = nullptr;
+  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("pipe ended prematurely", leftPromise.wait(ws));
+
+  // And we should see a short read here, too. In fact, we shouldn't see anything: the short read
+  // above read all of the pipe's data, but then failed to buffer it because it encountered an
+  // exception. It buffered the exception, instead.
+  uint8_t rightBuf[7];
+  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("pipe ended prematurely",
+      right->tryRead(rightBuf, 1, 1).wait(ws));
+}
+
+KJ_TEST("Userland tee pump") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  auto pipe = newOneWayPipe();
+  auto writePromise = pipe.out->write("foobar", 6);
+  auto tee = newTee(mv(pipe.in));
+  auto left = mv(tee.ins[0]);
+  auto right = mv(tee.ins[1]);
+
+  
+}
+
+// Pumping
+
+// Reading is as slow as pump sink
+
+// Pump with different amounts
+
 }  // namespace
 }  // namespace kj

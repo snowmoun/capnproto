@@ -31,6 +31,8 @@
 #include "vector.h"
 #include "io.h"
 #include "one-of.h"
+#include "map.h"
+#include <queue>
 
 #if _WIN32
 #include <winsock2.h>
@@ -1123,6 +1125,353 @@ TwoWayPipe newTwoWayPipe() {
   auto end1 = kj::heap<TwoWayPipeEnd>(kj::addRef(*pipe1), kj::addRef(*pipe2));
   auto end2 = kj::heap<TwoWayPipeEnd>(kj::mv(pipe2), kj::mv(pipe1));
   return { { kj::mv(end1), kj::mv(end2) } };
+}
+
+namespace {
+
+class AsyncTeeInterface {
+public:
+  virtual Promise<size_t> tryRead(void* branch, void* buffer, size_t minBytes, size_t maxBytes) = 0;
+  virtual Maybe<uint64_t> tryGetLength(void* branch) = 0;
+  virtual Promise<uint64_t> pumpTo(void* branch, AsyncOutputStream& output, uint64_t amount) = 0;
+  virtual void abortRead(void* branch) = 0;
+};
+
+class AsyncTee final: public AsyncTeeInterface, public Refcounted {
+public:
+  explicit AsyncTee(Own<AsyncInputStream> inner): inner(mv(inner)) {}
+  ~AsyncTee() noexcept(false) {
+#if 0
+    KJ_REQUIRE(state == nullptr || ownState.get() != nullptr,
+        "destroying AsyncTee with operation still in-progress; probably going to segfault") {
+      // Don't std::terminate().
+      break;
+    }
+#endif
+  }
+
+  void addBranch(void* branch) {
+    branches.insert(branch, State(Idle()));
+  }
+
+  Promise<size_t> tryRead(void* branch, void* buffer, size_t minBytes, size_t maxBytes) override {
+    auto& idleState = KJ_ASSERT_NONNULL(branches.find(branch)).get<Idle>();
+    KJ_ASSERT(idleState.pendingRead == nullptr);
+
+    // If there is excess data in the buffer for us, slurp that up.
+    auto readBuffer = arrayPtr(reinterpret_cast<byte*>(buffer), maxBytes);
+    auto amount = tryReadBuffer(idleState, readBuffer, minBytes);
+    if (minBytes == 0) {
+      return amount;
+    }
+
+    // We still need more data, so we'll need to queue a read task. Once our read task is executed,
+    // we can check to see if an earlier read task already populated our buffer, and if we still
+    // don't have enough, we can perform an inner read.
+
+    readQueue = readQueue.then([this, branch, minBytes]() mutable -> Promise<void> {
+      // A prior read operation may have populated our buffer. Slurp that up.
+      if (tryFulfillRead(branch, minBytes)) {
+        return READY_NOW;
+      }
+
+      // Since tryFulfillRead() returned false, we know that we're in the idle state with a pending
+      // read operation.
+      auto& pendingRead =
+          KJ_ASSERT_NONNULL(KJ_ASSERT_NONNULL(branches.find(branch)).get<Idle>().pendingRead);
+
+      // We must allocate a heap buffer for this read, because this outer read may be canceled, but
+      // we cannot let that affect the other branch's outer read, if any.
+      auto heapBuffer = heapArray<byte>(pendingRead.buffer.size());
+      return inner->tryRead(heapBuffer.begin(), minBytes, heapBuffer.size())
+          .then([this, branch, heapBuffer = mv(heapBuffer), minBytes](uint64_t amount) mutable {
+        auto promise = finishInnerRead(amount, mv(heapBuffer));
+        fulfillRead(branch, minBytes);
+        return mv(promise);
+      });
+    }).catch_([this, branch, minBytes](const Exception& exception) mutable {
+      finishInnerRead(exception);
+      fulfillRead(branch, minBytes);
+    }).eagerlyEvaluate(nullptr);
+
+    return newAdaptedPromise<size_t, PendingRead>(idleState, readBuffer, amount);
+  }
+
+  Maybe<uint64_t> tryGetLength(void* branch) override {
+    // TODO(now): Think this through.
+    return nullptr;
+  }
+
+  Promise<uint64_t> pumpTo(void* branch, AsyncOutputStream& output, uint64_t amount) override {
+    auto& state = KJ_ASSERT_NONNULL(branches.find(branch));
+    auto& idleState = state.get<Idle>();
+    KJ_ASSERT(idleState.pendingRead == nullptr);
+
+    readQueue = readQueue.then([this, branch, amount]) {
+
+    });
+
+    return newAdaptedPromise<size_t, PendingPump>(state, output, amount);
+
+    while (amount > 0 && !idleState.bufferList.empty()) {
+      auto heapBuffer = mv(idleState.bufferList.front());
+      idleState.bufferList.pop();
+
+    }
+
+    // If there is excess data in the buffer for us, slurp that up.
+    auto readBuffer = arrayPtr(reinterpret_cast<byte*>(buffer), maxBytes);
+    auto amount = tryPumpBuffer(idleState, output, amount);
+    if (minBytes == 0) {
+      return amount;
+    }
+  }
+
+  void abortRead(void* branch) override {
+    auto& state = KJ_ASSERT_NONNULL(branches.find(branch), "branch was already destroyed");
+    KJ_ASSERT(state.is<Idle>() && state.get<Idle>().pendingRead == nullptr,
+        "destroying tee branch with operation still in-progress; probably going to segfault") {
+      // Don't std::terminate().
+      break;
+    }
+    branches.erase(branch);
+  }
+
+private:
+  using BufferList = std::queue<Array<byte>>;
+  struct PendingRead;
+  struct Idle {
+    BufferList bufferList;
+    Maybe<PendingRead&> pendingRead;
+    Maybe<Exception> readError;
+  };
+  struct PendingPump;
+  struct Pumping {
+    PendingPump& pendingPump;
+  };
+
+  using State = OneOf<Idle, Pumping>;
+
+  struct PendingRead {
+    explicit PendingRead(PromiseFulfiller<size_t>& fulfiller, Idle& state, ArrayPtr<byte> buffer,
+                         uint64_t readSoFar)
+        : fulfiller(fulfiller), state(state), buffer(buffer), readSoFar(readSoFar) {
+      KJ_ASSERT(state.pendingRead == nullptr, "read initiated with read already in flight");
+      KJ_ASSERT(state.bufferList.empty(), "read initiated with data in buffer");
+      state.pendingRead = *this;
+    }
+    ~PendingRead() noexcept(false) {
+      KJ_IF_MAYBE(s, state) {
+        KJ_ASSERT(&KJ_ASSERT_NONNULL(s->pendingRead) == this);
+        s->pendingRead = nullptr;
+      }
+    }
+
+    PromiseFulfiller<size_t>& fulfiller;
+    Maybe<Idle&> state;
+    ArrayPtr<byte> buffer;
+    uint64_t readSoFar;
+  };
+
+  struct PendingPump {
+    explicit PendingPump(PromiseFulfiller<size_t>& fulfiller, AsyncOutputStream& output,
+                         State& state, uint64_t limit)
+        : fulfiller(fulfiller), output(output), state(state), limit(limit) {
+      KJ_ASSERT(state.is<Idle>(), "pump initiated with pump already in flight");
+      KJ_ASSERT(state.get<Idle>().pendingRead == nullptr,
+          "pump initiated with read already in flight");
+      KJ_ASSERT(state.get<Idle>().bufferList.empty(), "pump initiated with data in buffer");
+      state.init<Pumping>(Pumping { *this });
+    }
+    ~PendingPump() noexcept(false) {
+      KJ_IF_MAYBE(s, state) {
+        KJ_ASSERT(&s->get<Pumping>().pendingPump == this);
+        s->init<Idle>();
+      }
+    }
+
+    PromiseFulfiller<size_t>& fulfiller;
+    AsyncOutputStream& output;
+    Maybe<State&> state;
+    uint64_t limit;
+    uint64_t pumpedSoFar = 0;
+  };
+
+  Promise<void> finishInnerRead(uint64_t amount, Array<byte> heapBuffer) {
+    // TODO(perf): There are a few optimizations on `heapBuffer` we could perform here:
+    //   - Only needs to be refcounted if we're adding to multiple buffer lists.
+    //   - Only needs to be slice-attached if we're adding to any buffer list.
+    //   - We could include a heuristic to only copy the buffer to a new, smaller buffer if `amount`
+    //     is less than half the size of `heapBuffer.size()` or so. Otherwise we end up with a bunch
+    //     of small slices preserving large buffer lifetimes.
+    auto refcountedBytes = refcounted<RefcountedBytes>(mv(heapBuffer));
+    auto bufferPtr = refcountedBytes->bytes.slice(0, amount);
+
+    kj::Vector<Promise<void>> writePromises;
+
+    for (auto& entry: branches) {
+      KJ_SWITCH_ONEOF(entry.value) {
+        KJ_CASE_ONEOF(idleState, Idle) {
+          idleState.bufferList.push(bufferPtr.attach(addRef(*refcountedBytes)));
+        }
+        KJ_CASE_ONEOF(pumping, Pumping) {
+          auto promise = pumping.pendingPump.output.write(bufferPtr.begin(), bufferPtr.size())
+              .attach(addRef(*refcountedBytes));
+          writePromises.add(mv(promise));
+        }
+      }
+    }
+
+    if (writePromises.empty()) {
+      return READY_NOW;
+    }
+
+    // We must respect the backpressure of the slowest sink, so block any subsequent reads until
+    // our pump write promises have resolved.
+    return joinPromises(writePromises.releaseAsArray());
+  }
+
+  void finishInnerRead(const Exception& exception) {
+    for (auto& entry: branches) {
+      KJ_SWITCH_ONEOF(entry.value) {
+        KJ_CASE_ONEOF(idleState, Idle) {
+          idleState.readError = cp(exception);
+        }
+        KJ_CASE_ONEOF(pumping, Pumping) {
+          // `finishInnerRead()` is only called from within a `readQueue` promise callback, meaning
+          // we know that any pumping write promises have already settled. Rejecting this pumping
+          // promise now should therefore not drop any data.
+          pumping.pendingPump.fulfiller.reject(cp(exception));
+          pumping.pendingPump.state = nullptr;
+          entry.value.init<Idle>();
+        }
+      }
+    }
+  }
+
+  uint64_t tryReadBuffer(Idle& state, ArrayPtr<byte>& readBuffer, size_t& minBytes) {
+    // Attempt to consume as much data from `state`'s buffer list as `readBuffer` can handle. Slice
+    // `readBuffer` and decrement `minBytes` (stopping at zero) to reflect how much more data
+    // can/must be read. Return the total number of bytes read.
+    //
+    // If `minBytes` is zero after this function returns, the read can be considered fulfilled.
+
+    uint64_t totalAmount = 0;
+
+    while (minBytes > 0 && !state.bufferList.empty()) {
+      auto& heapBuffer = state.bufferList.front();
+
+      auto amount = min(heapBuffer.size(), readBuffer.size());
+      memcpy(readBuffer.begin(), heapBuffer.begin(), amount);
+      totalAmount += amount;
+
+      readBuffer = readBuffer.slice(amount, readBuffer.size());
+      minBytes -= min(amount, minBytes);
+
+      if (amount == heapBuffer.size()) {
+        state.bufferList.pop();
+      } else {
+        heapBuffer = heapBuffer.slice(amount, heapBuffer.size()).attach(mv(heapBuffer));
+        return totalAmount;
+      }
+    }
+
+    if (minBytes > 0) {
+      KJ_IF_MAYBE(e, mv(state.readError)) {
+        // We still need more, but there's an error.
+        throwRecoverableException(mv(*e));
+      }
+    }
+
+    return totalAmount;
+  }
+
+  bool tryFulfillRead(void* branch, size_t& minBytes, bool mustFulfill = false) {
+    // Try to fulfill a pending read operation on `branch`. Return true if the branch no longer
+    // exists, or the operation was fulfilled, canceled, or errored. Return false if the operation
+    // is still pending and we could not fulfill it.
+
+    KJ_IF_MAYBE(state, branches.find(branch)) {
+      // The initiating branch wasn't destroyed ...
+      KJ_IF_MAYBE(idleState, state->tryGet<Idle>()) {
+        // And it's still buffering ...
+        KJ_IF_MAYBE(pendingRead, idleState->pendingRead) {
+          // And the outer read wasn't canceled! (Or it was canceled, but immediately replaced with
+          // another read operation -- that's fine, too.) Try to fulfill it. Note that we don't
+          // care if we cannot completely fulfill `minBytes` worth. We did our best.
+          KJ_IF_MAYBE(exception, runCatchingExceptions([&] {
+            pendingRead->readSoFar += tryReadBuffer(*idleState, pendingRead->buffer, minBytes);
+          })) {
+            pendingRead->fulfiller.reject(mv(*exception));
+            pendingRead->state = nullptr;
+            idleState->pendingRead = nullptr;
+          } else {
+            if (minBytes == 0 || mustFulfill) {
+              // Either we satisfied the read request, or we have a short read.
+              pendingRead->fulfiller.fulfill(cp(pendingRead->readSoFar));
+              pendingRead->state = nullptr;
+              idleState->pendingRead = nullptr;
+            } else {
+              // We slurped as much as we could, didn't encounter an exception, need more, and
+              // haven't made an inner read yet.
+              return false;
+            }
+          }
+        }
+      }
+    }
+
+    return true;
+  }
+
+  void fulfillRead(void* branch, size_t& minBytes) {
+    KJ_ASSERT(tryFulfillRead(branch, minBytes, true));
+  }
+
+  struct RefcountedBytes final: public kj::Refcounted {
+    kj::Array<kj::byte> bytes;
+    RefcountedBytes(kj::Array<kj::byte>&& bytes): bytes(kj::mv(bytes)) {}
+  };
+
+  Own<AsyncInputStream> inner;
+  HashMap<void*, State> branches;
+  Promise<void> readQueue = READY_NOW;
+};
+
+class TeeBranch final: public AsyncInputStream {
+public:
+  TeeBranch(Own<AsyncTee> tee): tee(mv(tee)) { this->tee->addBranch(this); }
+  ~TeeBranch() noexcept(false) {
+    unwind.catchExceptionsIfUnwinding([&]() {
+      tee->abortRead(this);
+    });
+  }
+
+  Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
+    return tee->tryRead(this, buffer, minBytes, maxBytes);
+  }
+
+  Promise<uint64_t> pumpTo(AsyncOutputStream& output, uint64_t amount) override {
+    return tee->pumpTo(this, output, amount);
+  }
+
+  Maybe<uint64_t> tryGetLength() override {
+    return tee->tryGetLength(this);
+  }
+
+private:
+  Own<AsyncTee> tee;
+  UnwindDetector unwind;
+};
+
+}  // namespace
+
+Tee newTee(Own<AsyncInputStream> input) {
+  // TODO(now): Optimize if `input` is a TeeBranch.
+  auto impl = refcounted<AsyncTee>(mv(input));
+  Own<AsyncInputStream> branch1 = heap<TeeBranch>(addRef(*impl));
+  Own<AsyncInputStream> branch2 = heap<TeeBranch>(mv(impl));
+  return { mv(branch1), mv(branch2) };
 }
 
 Promise<Own<AsyncCapabilityStream>> AsyncCapabilityStream::receiveStream() {
